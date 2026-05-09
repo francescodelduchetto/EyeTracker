@@ -8,7 +8,13 @@ from scipy.spatial.transform import Rotation as Rscipy
 from collections import deque
 import pyautogui
 import threading
-import keyboard
+import sys
+
+if sys.platform == "darwin":
+    # The keyboard package needs elevated privileges on macOS.
+    keyboard = None
+else:
+    import keyboard
 
 # Screen and mouse control setup (from old script)
 MONITOR_WIDTH, MONITOR_HEIGHT = pyautogui.size()
@@ -60,7 +66,21 @@ R_ref_forehead = [None]
 calibration_nose_scale = None
 
 # Initialize MediaPipe FaceMesh
-mp_face_mesh = mp.solutions.face_mesh
+def _load_mp_face_mesh_module():
+    # Support both legacy (mp.solutions) and direct module layouts.
+    if hasattr(mp, "solutions") and hasattr(mp.solutions, "face_mesh"):
+        return mp.solutions.face_mesh
+    try:
+        from mediapipe.python.solutions import face_mesh as face_mesh_module
+        return face_mesh_module
+    except Exception as exc:
+        raise ImportError(
+            "MediaPipe FaceMesh API not found. Install the official 'mediapipe' package "
+            "in this virtual environment, or use a Python version supported by MediaPipe."
+        ) from exc
+
+
+mp_face_mesh = _load_mp_face_mesh_module()
 face_mesh = mp_face_mesh.FaceMesh(
     static_image_mode=False,
     max_num_faces=1,
@@ -81,12 +101,26 @@ nose_indices = [4, 45, 275, 220, 440, 1, 5, 51, 281, 44, 274, 241,
                 3, 248]
 
 # ===== NEW: File writing for screen position =====
-screen_position_file = "C:/Storage/Google Drive/Software/EyeTracker3DPython/screen_position.txt"
+# Optional override: export EYETRACKER_SCREEN_POSITION_FILE=/path/to/screen_position.txt
+screen_position_file = os.environ.get(
+    "EYETRACKER_SCREEN_POSITION_FILE",
+    os.path.join(os.path.dirname(__file__), "screen_position.txt")
+)
+_screen_position_write_warned = False
 
 def write_screen_position(x, y):
     """Write screen position to file, overwriting the same line"""
-    with open(screen_position_file, 'w') as f:
-        f.write(f"{x},{y}\n")
+    global _screen_position_write_warned
+    try:
+        parent_dir = os.path.dirname(screen_position_file)
+        if parent_dir:
+            os.makedirs(parent_dir, exist_ok=True)
+        with open(screen_position_file, 'w') as f:
+            f.write(f"{x},{y}\n")
+    except OSError as exc:
+        if not _screen_position_write_warned:
+            print(f"[Screen Position] Could not write to {screen_position_file}: {exc}")
+            _screen_position_write_warned = True
 
 def _rot_x(a):
     ca, sa = math.cos(a), math.sin(a)
@@ -178,8 +212,8 @@ def create_monitor_plane(head_center, R_final, face_landmarks, w, h,
 
 
 
-def update_orbit_from_keys():
-    """Keyboard orbit controls that PRINT every frame while a key is held."""
+def update_orbit_from_keys(key_ascii=None):
+    """Orbit controls from OpenCV key events, with optional keyboard fallback."""
     global orbit_yaw, orbit_pitch, orbit_radius
     yaw_step   = math.radians(1.5)
     pitch_step = math.radians(1.5)
@@ -187,24 +221,34 @@ def update_orbit_from_keys():
 
     changed = False
 
+    def pressed(char):
+        if key_ascii == ord(char):
+            return True
+        if keyboard is not None:
+            try:
+                return keyboard.is_pressed(char)
+            except Exception:
+                return False
+        return False
+
     # Rotate
-    if keyboard.is_pressed('j'):  # yaw left
+    if pressed('j'):  # yaw left
         orbit_yaw -= yaw_step; changed = True
-    if keyboard.is_pressed('l'):  # yaw right
+    if pressed('l'):  # yaw right
         orbit_yaw += yaw_step; changed = True
-    if keyboard.is_pressed('i'):  # pitch up
+    if pressed('i'):  # pitch up
         orbit_pitch += pitch_step; changed = True
-    if keyboard.is_pressed('k'):  # pitch down
+    if pressed('k'):  # pitch down
         orbit_pitch -= pitch_step; changed = True
 
     # Zoom
-    if keyboard.is_pressed('['):  # zoom out
+    if pressed('['):  # zoom out
         orbit_radius += zoom_step; changed = True
-    if keyboard.is_pressed(']'):  # zoom in
+    if pressed(']'):  # zoom in
         orbit_radius = max(80.0, orbit_radius - zoom_step); changed = True
 
     # Reset (prints every frame while held)
-    if keyboard.is_pressed('r'):
+    if pressed('r'):
         orbit_yaw = 0.0
         orbit_pitch = 0.0
         orbit_radius = 600.0
@@ -574,10 +618,36 @@ def render_debug_view_orbit(
             if parts:
                 combined_dir = _normalize(np.mean(parts, axis=0))
         if combined_dir is not None:
-            p0 = project_point(origin_mid)
-            p1 = project_point(origin_mid + _normalize(combined_dir) * (gaze_len * 1.2))
-            if p0 is not None and p1 is not None:
-                cv2.line(debug, p0[0], p1[0], (155, 200, 10), 2)
+            gaze_dir_n = _normalize(combined_dir)
+            # Keep this vector visible even when the requested length projects off-screen.
+            tip_2d = None
+            for L in (gaze_len * 1.2, gaze_len * 0.7, gaze_len * 0.4, 320.0, 180.0, 100.0):
+                gaze_tip_try = origin_mid + gaze_dir_n * float(L)
+                p0_try = project_point(origin_mid)
+                p1_try = project_point(gaze_tip_try)
+                if p0_try is not None and p1_try is not None:
+                    draw_arrow_3d(origin_mid, gaze_tip_try, color=(80, 255, 80), thickness=3)
+                    tip_2d = p1_try
+                    break
+
+            if tip_2d is not None:
+                cv2.putText(debug, "3D Gaze Vector",
+                            (tip_2d[0][0] + 8, tip_2d[0][1] - 8),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (80, 255, 80), 1, cv2.LINE_AA)
+            else:
+                # If still not drawable (e.g., extreme camera orientation), show status text.
+                cv2.putText(debug, "3D Gaze Vector: off-screen",
+                            (10, 46), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (80, 255, 80), 1, cv2.LINE_AA)
+
+            cv2.putText(debug,
+                        f"gaze xyz: ({gaze_dir_n[0]:+.3f}, {gaze_dir_n[1]:+.3f}, {gaze_dir_n[2]:+.3f})",
+                        (10, 24),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (80, 255, 80), 1, cv2.LINE_AA)
+
+            cv2.putText(debug,
+                        "Overall gaze ray shown in green",
+                        (10, 68),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (80, 255, 80), 1, cv2.LINE_AA)
 
     # --- Monitor plane ---
     if monitor_corners is not None:
@@ -676,7 +746,7 @@ def render_debug_view_orbit(
         "R = reset view",
         "X = add marker",
         "q = quit",
-        "F7 = toggle mouse control"
+        "M (or F7) = toggle mouse control"
     ]
 
     font        = cv2.FONT_HERSHEY_SIMPLEX
@@ -780,6 +850,24 @@ while cap.isOpened():
 
         iris_3d_left = np.array([left_iris.x * w, left_iris.y * h, left_iris.z * w])
         iris_3d_right = np.array([right_iris.x * w, right_iris.y * h, right_iris.z * w])
+
+        # Always show an overall gaze direction in the main window.
+        # Before calibration ('c'), this is a provisional ray based on head forward.
+        if not (left_sphere_locked and right_sphere_locked):
+            provisional_origin = (iris_3d_left + iris_3d_right) / 2.0
+            provisional_dir = -R_final[:, 2]
+            n_prov = np.linalg.norm(provisional_dir)
+            if n_prov > 1e-9:
+                provisional_dir = provisional_dir / n_prov
+                provisional_target = provisional_origin + provisional_dir * (gaze_length * 0.9)
+                p0 = (int(provisional_origin[0]), int(provisional_origin[1]))
+                p1 = (int(provisional_target[0]), int(provisional_target[1]))
+                clipped, cp0, cp1 = cv2.clipLine((0, 0, w, h), p0, p1)
+                if clipped:
+                    cv2.arrowedLine(frame, cp0, cp1, (255, 0, 255), 3, tipLength=0.2)
+                    cv2.circle(frame, cp0, 4, (255, 0, 255), -1)
+                cv2.putText(frame, "PROVISIONAL GAZE (press C to calibrate)",
+                            (10, 64), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 0, 255), 2, cv2.LINE_AA)
         
         if left_sphere_locked and right_sphere_locked:
             # ==== DRAW LEFT AND RIGHT GAZE ====
@@ -826,16 +914,32 @@ while cap.isOpened():
             # Draw combined gaze ray for visualization
             combined_origin = (sphere_world_l + sphere_world_r) / 2
             combined_target = combined_origin + avg_combined_direction * gaze_length
-            cv2.line(
+            p0 = (int(combined_origin[0]), int(combined_origin[1]))
+            p1 = (int(combined_target[0]), int(combined_target[1]))
+            clipped, cp0, cp1 = cv2.clipLine((0, 0, w, h), p0, p1)
+            if clipped:
+                cv2.arrowedLine(frame, cp0, cp1, (0, 80, 255), 4, tipLength=0.18)
+                cv2.circle(frame, cp0, 5, (0, 80, 255), -1)
+                label_pos = (max(10, cp1[0] + 8), max(20, cp1[1] - 8))
+            else:
+                # Keep a clear indicator even if the 2D projection is fully off-screen.
+                label_pos = (10, 60)
+
+            cv2.putText(
                 frame,
-                (int(combined_origin[0]), int(combined_origin[1])),
-                (int(combined_target[0]), int(combined_target[1])),
-                (255, 255, 10), 3
+                "OVERALL GAZE (main view)",
+                label_pos,
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 80, 255),
+                2,
+                cv2.LINE_AA,
             )
 
             # Center multiple lines of text
             texts = [
                 f"Screen: ({screen_x}, {screen_y})",
+                f"Gaze3D: ({avg_combined_direction[0]:+.3f}, {avg_combined_direction[1]:+.3f}, {avg_combined_direction[2]:+.3f})",
                 #f"Mouse: {'ON' if mouse_control_enabled else 'OFF'}"
             ]
 
@@ -847,18 +951,15 @@ while cap.isOpened():
             for i, text in enumerate(texts):
                 (text_width, text_height), baseline = cv2.getTextSize(text, font, font_scale, thickness)
                 center_x = (w - text_width) // 2
-                #center_y = (h // 2) + (i - len(texts)//2) * line_spacing
+                center_y = 30 + i * line_spacing
                 
                 color = (0, 255, 0) if "Mouse: ON" not in text else (0, 255, 0) if mouse_control_enabled else (0, 0, 255)
-                cv2.putText(frame, text, (center_x, 30), font, font_scale, color, thickness)
+                cv2.putText(frame, text, (center_x, center_y), font, font_scale, color, thickness)
 
         # Draw all landmark points in white
         for idx, lm in enumerate(face_landmarks):
             x, y = int(lm.x * w), int(lm.y * h)
             cv2.circle(frame, (x, y), 0, (255, 255, 255), -1)
-
-        # Smooth orbit controls each frame
-        update_orbit_from_keys()
 
         # Build 3D landmarks in your existing scale (x*w, y*h, z*w)
         landmarks3d = None
@@ -889,16 +990,21 @@ while cap.isOpened():
 
     cv2.imshow("Integrated Eye Tracking", frame)
 
+    key_code = cv2.waitKeyEx(1)
+    key_ascii = key_code & 0xFF
+
+    # Orbit/debug controls from OpenCV key events.
+    update_orbit_from_keys(key_ascii)
+
     # Handle keyboard input
-    if keyboard.is_pressed('f7'):
+    f7_pressed = key_code in (0x760000, 0x7600000)
+    if key_ascii == ord('m') or f7_pressed:
         mouse_control_enabled = not mouse_control_enabled
         print(f"[Mouse Control] {'Enabled' if mouse_control_enabled else 'Disabled'}")
-        time.sleep(0.3)  # debounce to prevent rapid toggling
 
-    key = cv2.waitKey(1) & 0xFF
-    if key == ord('q'):
+    if key_ascii == ord('q'):
         break
-    elif key == ord('c') and not (left_sphere_locked and right_sphere_locked):
+    elif key_ascii == ord('c') and not (left_sphere_locked and right_sphere_locked):
         current_nose_scale = compute_scale(nose_points_3d)
         # Lock LEFT eye
         left_sphere_local_offset = R_final.T @ (iris_3d_left - head_center)
@@ -951,7 +1057,7 @@ while cap.isOpened():
 
 
         print("[Both Spheres Locked] Eye sphere calibration complete.")
-    elif key == ord('s') and left_sphere_locked and right_sphere_locked:
+    elif key_ascii == ord('s') and left_sphere_locked and right_sphere_locked:
         # Screen calibration - user should look at center of screen when pressing 's'
         # Get current gaze direction
         left_gaze_dir = iris_3d_left - sphere_world_l
@@ -971,7 +1077,7 @@ while cap.isOpened():
         calibration_offset_pitch = 0 - raw_pitch
         
         print(f"[Screen Calibrated] Offset Yaw: {calibration_offset_yaw:.2f}, Offset Pitch: {calibration_offset_pitch:.2f}")
-    elif key == ord('x'):
+    elif key_ascii == ord('x'):
         # Drop a marker at the current gaze∩monitor point
         if (monitor_corners is not None and monitor_center_w is not None and monitor_normal_w is not None
             and left_sphere_locked and right_sphere_locked):
