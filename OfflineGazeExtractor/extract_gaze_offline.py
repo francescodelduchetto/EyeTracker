@@ -178,6 +178,10 @@ def _draw_wire_box(frame, corners, color, thickness=2):
             cv2.line(frame, a, b, color, thickness, cv2.LINE_AA)
 
 
+# Reference inter-eye span (px) the box constants below were designed for.
+_REF_EYE_SPAN_PX = 120.0
+
+
 def _draw_main_overlay(
     frame,
     eye_mid: np.ndarray,
@@ -186,6 +190,7 @@ def _draw_main_overlay(
     confidence: float,
     text: str,
     conf_threshold: float = 0.45,
+    eye_span_px: float = _REF_EYE_SPAN_PX,
 ):
     h, w = frame.shape[:2]
 
@@ -195,12 +200,13 @@ def _draw_main_overlay(
     if np.linalg.norm(up_n) < 1e-6:
         up_n = np.array([0.0, -1.0, 0.0], dtype=float)
 
-    near_d = 70.0
-    far_d = 190.0
-    half_w_near = 30.0
-    half_h_near = 22.0
-    half_w_far = 52.0
-    half_h_far = 38.0
+    s = max(eye_span_px, 1.0) / _REF_EYE_SPAN_PX
+    near_d = 70.0 * s
+    far_d = 190.0 * s
+    half_w_near = 30.0 * s
+    half_h_near = 22.0 * s
+    half_w_far = 52.0 * s
+    half_h_far = 38.0 * s
 
     c_near = eye_mid + gaze_n * near_d
     c_far = eye_mid + gaze_n * far_d
@@ -317,9 +323,15 @@ def process_video(
             "frame": frame_idx,
             "time_sec": timestamp,
             "face_detected": 0,
+            "eye_mid_x": 0.0,
+            "eye_mid_y": 0.0,
+            "eye_span_px": 0.0,
             "head_forward_x": 0.0,
             "head_forward_y": 0.0,
             "head_forward_z": 0.0,
+            "head_right_x": 0.0,
+            "head_right_y": 0.0,
+            "head_right_z": 0.0,
             "gaze_rel_x": 0.0,
             "gaze_rel_y": 0.0,
             "gaze_rel_z": 0.0,
@@ -341,9 +353,18 @@ def process_video(
             row.update(
                 {
                     "face_detected": 1,
+                    "eye_mid_x": float(eye_mid[0]),
+                    "eye_mid_y": float(eye_mid[1]),
+                    "eye_span_px": float(np.linalg.norm(
+                        _as_px(lms[LEFT_EYE_OUTER], w, h)[:2]
+                        - _as_px(lms[RIGHT_EYE_OUTER], w, h)[:2]
+                    )),
                     "head_forward_x": float(head_forward[0]),
                     "head_forward_y": float(head_forward[1]),
                     "head_forward_z": float(head_forward[2]),
+                    "head_right_x": float(head_right[0]),
+                    "head_right_y": float(head_right[1]),
+                    "head_right_z": float(head_right[2]),
                     "gaze_rel_x": float(gaze_rel[0]),
                     "gaze_rel_y": float(gaze_rel[1]),
                     "gaze_rel_z": float(gaze_rel[2]),
@@ -359,7 +380,12 @@ def process_video(
 
             if preview:
                 status = f"f={frame_idx} t={timestamp:.3f}s conf={conf:.2f}"
-                _draw_main_overlay(frame, eye_mid, gaze_rel, head_right, conf, status)
+                eye_span = float(np.linalg.norm(
+                        _as_px(lms[LEFT_EYE_OUTER], w, h)[:2]
+                        - _as_px(lms[RIGHT_EYE_OUTER], w, h)[:2]
+                    ))
+                _draw_main_overlay(frame, eye_mid, gaze_rel, head_right, conf, status,
+                                   eye_span_px=eye_span)
 
         rows_by_frame[frame_idx] = row
 
@@ -430,12 +456,104 @@ def process_video(
     print(f"JSON: {json_path}")
 
 
+def replay_video(input_path: str, csv_path: str = None) -> None:
+    """Replay a video with gaze overlay drawn from a previously extracted CSV."""
+    video = Path(input_path)
+    if csv_path is None:
+        csv_path = str(video.parent / (video.stem + "_gaze.csv"))
+
+    if not os.path.isfile(csv_path):
+        raise FileNotFoundError(
+            f"Gaze CSV not found: {csv_path}\n"
+            "Run without --replay first to extract gaze data."
+        )
+
+    # Load CSV into a dict keyed by frame index
+    gaze_data: Dict[int, dict] = {}
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            gaze_data[int(row["frame"])] = row
+
+    cap = cv2.VideoCapture(input_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video: {input_path}")
+
+    fps = float(cap.get(cv2.CAP_PROP_FPS)) or 30.0
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    frame_idx = 0
+    playing = True
+
+    while True:
+        frame_idx = int(_clamp(frame_idx, 0, max(total_frames - 1, 0)))
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        ok, frame = cap.read()
+        if not ok:
+            break
+
+        h, w = frame.shape[:2]
+        row = gaze_data.get(frame_idx)
+        if row and int(row.get("face_detected", 0)):
+            gaze_rel = np.array([
+                float(row["gaze_rel_x"]),
+                float(row["gaze_rel_y"]),
+                float(row["gaze_rel_z"]),
+            ])
+            head_right = np.array([
+                float(row["head_right_x"]),
+                float(row["head_right_y"]),
+                float(row["head_right_z"]),
+            ])
+            eye_mid = np.array([float(row["eye_mid_x"]), float(row["eye_mid_y"]), 0.0])
+            eye_span = float(row.get("eye_span_px", _REF_EYE_SPAN_PX))
+            conf = float(row.get("confidence", 0.0))
+            status = (
+                f"f={frame_idx} t={float(row['time_sec']):.3f}s "
+                f"yaw={float(row['eye_yaw_proxy_deg']):.1f}deg "
+                f"pitch={float(row['eye_pitch_proxy_deg']):.1f}deg "
+                f"conf={conf:.2f}"
+            )
+            _draw_main_overlay(frame, eye_mid, gaze_rel, head_right, conf, status,
+                               eye_span_px=eye_span)
+        else:
+            cv2.putText(frame, f"f={frame_idx}  no face", (10, 28),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (80, 80, 80), 2, cv2.LINE_AA)
+
+        cv2.putText(frame, "REPLAY MODE", (w - 160, 28),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2, cv2.LINE_AA)
+        cv2.imshow("Gaze Replay", frame)
+        key_code = cv2.waitKeyEx(1)
+        key_ascii = key_code & 0xFF
+
+        if key_ascii == ord("q"):
+            break
+        elif key_ascii == ord(" "):
+            playing = not playing
+        elif _is_left_key(key_code) or key_ascii == ord("a"):
+            playing = False
+            frame_idx -= 1
+        elif _is_right_key(key_code) or key_ascii == ord("d"):
+            playing = False
+            frame_idx += 1
+        elif playing:
+            frame_idx += 1
+
+        if total_frames > 0 and frame_idx >= total_frames:
+            break
+        if frame_idx < 0:
+            frame_idx = 0
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".flv", ".wmv", ".m4v"}
 
 
-def _find_videos(folder: str) -> List[Path]:
+def _find_videos(folder: str, recursive: bool = False, pattern: str = "*") -> List[Path]:
+    root = Path(folder)
+    glob_fn = root.rglob if recursive else root.glob
     return sorted(
-        p for p in Path(folder).iterdir()
+        p for p in glob_fn(pattern)
         if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS
     )
 
@@ -457,6 +575,11 @@ def parse_args():
     input_group = parser.add_mutually_exclusive_group(required=True)
     input_group.add_argument("--input", help="Path to a single input video")
     input_group.add_argument("--input-dir", help="Folder of videos to batch-process")
+    input_group.add_argument(
+        "--replay",
+        metavar="VIDEO",
+        help="Path to a video whose gaze has already been extracted; shows overlay from the CSV next to it",
+    )
     parser.add_argument(
         "--output-dir",
         default=None,
@@ -476,6 +599,16 @@ def parse_args():
         "--preview",
         action="store_true",
         help="Show live overlay while processing a single file (press q to stop)",
+    )
+    parser.add_argument(
+        "--recursive",
+        action="store_true",
+        help="Search subfolders recursively for videos (batch mode only)",
+    )
+    parser.add_argument(
+        "--pattern",
+        default="*",
+        help="Glob pattern to filter video filenames, e.g. '*participant*' (default: *, match all)",
     )
     parser.add_argument(
         "--workers",
@@ -499,6 +632,10 @@ def parse_args():
 def main():
     args = parse_args()
 
+    if args.replay:
+        replay_video(args.replay)
+        return
+
     if args.input:
         # Single-file mode
         process_video(
@@ -510,18 +647,30 @@ def main():
         return
 
     # Batch mode
-    videos = _find_videos(args.input_dir)
+    videos = _find_videos(args.input_dir, recursive=args.recursive, pattern=args.pattern)
     if not videos:
-        print(f"No video files found in {args.input_dir}", file=sys.stderr)
+        print(
+            f"No video files found in {args.input_dir}"
+            + (f" matching '{args.pattern}'" if args.pattern != "*" else "")
+            + (" (recursive)" if args.recursive else ""),
+            file=sys.stderr,
+        )
         sys.exit(1)
 
+    root = Path(args.input_dir)
     out_dir = Path(args.output_dir) if args.output_dir else None
     if out_dir:
         out_dir.mkdir(parents=True, exist_ok=True)
 
     work_items = []
     for v in videos:
-        dest = out_dir or v.parent
+        if out_dir:
+            # Mirror subfolder structure under output-dir
+            rel = v.parent.relative_to(root)
+            dest = out_dir / rel
+            dest.mkdir(parents=True, exist_ok=True)
+        else:
+            dest = v.parent
         work_items.append((
             str(v),
             str(dest / (v.stem + "_gaze.csv")),
